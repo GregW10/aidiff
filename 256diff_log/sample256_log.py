@@ -5,6 +5,8 @@ import numpy as np
 import struct
 from unet256_log import UNet
 from tqdm import tqdm
+import os
+import sys
 
 import math
 
@@ -32,12 +34,12 @@ class DiffusionModel:
             mu, sig = lognormal_to_gauss(0.01, 5)
             params = torch.zeros(size=(num_samples, 3), device=self.device)
             for i in range(num_samples):
-                ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                while wav > ap:
-                    ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                    wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                zd = np.random.lognormal(mean=mu, sigma=sig, size=1)
+                ap = np.random.lognormal(mean=mu, sigma=sig)
+                wav = np.random.lognormal(mean=mu, sigma=sig)
+                while wav > ap or wav*20 < ap:
+                    ap = np.random.lognormal(mean=mu, sigma=sig)
+                    wav = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=mu, sigma=sig)
                 params[i][0] = ap
                 params[i][1] = wav
                 params[i][2] = zd
@@ -46,7 +48,7 @@ class DiffusionModel:
                           (torch.tensor([extrema['log_aperture_max'], extrema['log_wavelength_max'], extrema['log_distance_max']]).to(self.device) - \
                            torch.tensor([extrema['log_aperture_min'], extrema['log_wavelength_min'], extrema['log_distance_min']]).to(self.device))
         x = torch.randn((num_samples, self.num_channels, self.width, self.height)).to(self.device)
-        pfunc = tqdm if torch.cuda.device_count() == 0 else lambda x: x
+        pfunc = tqdm if os.isatty(sys.stdout.fileno()) else lambda x: x
 
         for t in pfunc(range(self.T, 0, -1)):
             z = torch.randn_like(x).to(self.device) if t > 1 else torch.zeros_like(x).to(self.device)
@@ -80,7 +82,7 @@ def main():
     for i in range(num_samples):
         plt.imshow(samples[i][0].cpu().numpy(), cmap="gray")
         plt.title(f"Aperture: {params[i][0].item()}, Wavelength: {params[i][1].item()}, Distance: {params[i][2].item()}")
-        plt.savefig(f"sample_{i}.png")
+        plt.savefig(f"ap{params[i][0].item()}_wav{params[i][1].item()}_dist{params[i][2].item()}.png")
         plt.clf()
 
 if __name__ == "__main__":

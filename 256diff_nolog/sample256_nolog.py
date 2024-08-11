@@ -5,13 +5,17 @@ import numpy as np
 import struct
 from unet256_nolog import UNet
 from tqdm import tqdm
+import os
+import sys
 
 import math
+
 
 def lognormal_to_gauss(mu_ln: float, sigma_ln: float) -> tuple[float, float]:
     sig_over_mu = sigma_ln / mu_ln
     squared_p1 = 1 + sig_over_mu * sig_over_mu
     return (math.log(mu_ln / math.sqrt(squared_p1)), math.sqrt(math.log(squared_p1)))
+
 
 class DiffusionModel:
     def __init__(self, T: int, model: nn.Module, width: int = 256, height: int = 256, num_channels: int = 1, device: str = "cpu"):
@@ -32,12 +36,12 @@ class DiffusionModel:
             mu, sig = lognormal_to_gauss(0.01, 5)
             params = torch.zeros(size=(num_samples, 3), device=self.device)
             for i in range(num_samples):
-                ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                while wav > ap:
-                    ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                    wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                zd = np.random.lognormal(mean=mu, sigma=sig, size=1)
+                ap = np.random.lognormal(mean=mu, sigma=sig)
+                wav = np.random.lognormal(mean=mu, sigma=sig)
+                while wav > ap or wav*20 < ap:
+                    ap = np.random.lognormal(mean=mu, sigma=sig)
+                    wav = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=mu, sigma=sig)
                 params[i][0] = ap
                 params[i][1] = wav
                 params[i][2] = zd
@@ -46,7 +50,7 @@ class DiffusionModel:
         normed_params[:, 1] /= extrema["wavelength_max"]
         normed_params[:, 2] /= extrema["distance_max"]
         x = torch.randn((num_samples, self.num_channels, self.width, self.height)).to(self.device)
-        pfunc = tqdm if torch.cuda.device_count() == 0 else lambda x: x
+        pfunc = tqdm if os.isatty(sys.stdout.fileno()) else lambda x: x
 
         for t in pfunc(range(self.T, 0, -1)):
             z = torch.randn_like(x).to(self.device) if t > 1 else torch.zeros_like(x).to(self.device)
@@ -55,12 +59,14 @@ class DiffusionModel:
                  torch.sqrt(self.betas[t - 1, None, None, None]) * z)
         return x, params
 
+
 def load_extrema(file_path):
     with open(file_path, "rb") as f:
         data = f.read()
     extrema_values = struct.unpack('d' * (len(data) // 8), data)
     extrema_keys = ["intensity_min", "intensity_max", "aperture_min", "aperture_max", "wavelength_min", "wavelength_max", "distance_min", "distance_max"]
     return dict(zip(extrema_keys, extrema_values))
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,8 +81,9 @@ def main():
     for i in range(num_samples):
         plt.imshow(samples[i][0].cpu().numpy(), cmap="gray")
         plt.title(f"Aperture: {params[i][0].item()}, Wavelength: {params[i][1].item()}, Distance: {params[i][2].item()}")
-        plt.savefig(f"sample_{i}.png")
+        plt.savefig(f"ap{params[i][0].item()}_wav{params[i][1].item()}_dist{params[i][2].item()}.png")
         plt.clf()
+
 
 if __name__ == "__main__":
     main()
