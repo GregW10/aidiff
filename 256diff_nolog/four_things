@@ -1,0 +1,4 @@
+1. Correct "dffinf" (should throw error)
+2. Normalise patterns in "sampleANDcompare256_nolog.py"
+3. Correct "sizeof(T)" in "sampleANDcompare256_nolog.py"
+4. Remove ".6f"

@@ -2,8 +2,11 @@ __pycache__/
 .idea/
 discarded_pats/
 bad/
+compared/
 
 *.pth
 *.csv
 *.png
-
+*.xtr
+*.bmp
+*.dffr

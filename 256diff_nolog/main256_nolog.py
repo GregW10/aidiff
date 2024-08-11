@@ -240,8 +240,11 @@ class DiffusionModel:
             if self.rank == 0 and epoch % 100 == 0:
                 print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item()}", flush=True)
                 cf.write(f"{epoch},{loss.item()}\n")
+                if epoch % 1_000 == 0:
+                    torch.save(self.model.state_dict(), f"model_epoch{epoch}.pth")
 
-        dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
         if self.rank == 0:
             cf.close()
             torch.save(self.model.state_dict(), model_path)
@@ -253,12 +256,12 @@ class DiffusionModel:
             mu, sig = lognormal_to_gauss(0.01, 5)
             params = torch.zeros(size=(num_samples, 3), device=self.device)
             for i in range(num_samples):
-                ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                while wav > ap:
-                    ap = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                    wav = np.random.lognormal(mean=mu, sigma=sig, size=1)
-                zd = np.random.lognormal(mean=mu, sigma=sig, size=1)
+                ap = np.random.lognormal(mean=mu, sigma=sig)
+                wav = np.random.lognormal(mean=mu, sigma=sig)
+                while wav > ap or wav*20 < ap:
+                    ap = np.random.lognormal(mean=mu, sigma=sig)
+                    wav = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=mu, sigma=sig)
                 params[i][0] = ap
                 params[i][1] = wav
                 params[i][2] = zd
@@ -267,7 +270,7 @@ class DiffusionModel:
         normed_params[:, 1] /= dataset.extrema["wavelength_max"]
         normed_params[:, 2] /= dataset.extrema["distance_max"]
         x = torch.randn((num_samples, self.num_channels, self.height, self.width)).to(self.device)
-        pfunc = tqdm if self.rank == 0 else lambda x: x
+        pfunc = tqdm if (self.rank == 0 or not os.isatty(sys.stdout.fileno())) else lambda x: x
 
         for t in pfunc(range(self.T, 0, -1)):
             z = torch.randn_like(x).to(self.device) if t > 1 else torch.zeros_like(x).to(self.device)

@@ -33,7 +33,8 @@ class DiffusionModel:
     @torch.no_grad
     def sample(self, extrema, num_samples=1, params=None):
         if params is None:
-            mu, sig = lognormal_to_gauss(0.01, 5)
+            mu, sig = lognormal_to_gauss(0.005, 5)
+            muz, sigz = lognormal_to_gauss(0.01, 4)
             params = torch.zeros(size=(num_samples, 3), device=self.device)
             for i in range(num_samples):
                 ap = np.random.lognormal(mean=mu, sigma=sig)
@@ -41,11 +42,11 @@ class DiffusionModel:
                 while wav > ap or wav*20 < ap:
                     ap = np.random.lognormal(mean=mu, sigma=sig)
                     wav = np.random.lognormal(mean=mu, sigma=sig)
-                zd = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=muz, sigma=sigz)
                 params[i][0] = ap
                 params[i][1] = wav
                 params[i][2] = zd
-        normed_params = params
+        normed_params = params.clone()
         normed_params[:, 0] /= extrema["aperture_max"]
         normed_params[:, 1] /= extrema["wavelength_max"]
         normed_params[:, 2] /= extrema["distance_max"]
