@@ -191,6 +191,7 @@ def main():
     model = UNet().to(device)
     model.load_state_dict(torch.load('model.pth'))
     extrema = load_extrema("extrema.xtr")
+    print(f"Extrema are:\n{extrema}")
     diff_model = DiffusionModel(T=1_000, model=model, width=256, height=256, device=device)
 
     num_samples = 1

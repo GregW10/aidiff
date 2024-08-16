@@ -44,22 +44,52 @@ def is_symmetric(image, threshold=0.001):
     return symm_yx < threshold and symm_ynegx < threshold
 
 
+def load_extrema(file_path):
+    with open(file_path, "rb") as f:
+        data = f.read()
+    extrema_values = struct.unpack('d' * (len(data) // 8), data)
+    extrema_keys = ["intensity_min", "intensity_max", "aperture_min", "aperture_max", "wavelength_min", "wavelength_max", "distance_min", "distance_max"]
+    return dict(zip(extrema_keys, extrema_values))
+
+
 class DFFRDataset(Dataset):
-    def __init__(self, data_dir, device, threshold=0.00001):
+    def __init__(self, data_dir, device, threshold=0.00001, rnk=0):
+        # super(DFFRDataset, self).__init__()
         self.data_dir = data_dir
         self.device = device
         self.threshold = threshold
         self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.dffr')]
         self.discarded_files = []
         if threshold >= 0.0:
-            self.files = self.filter_symmetric_files()
-        self.extrema = self.find_extrema()
-        print("Data Extremes:", self.extrema)
-        serialised_data = bytearray()
-        for value in self.extrema.values():
-            serialised_data.extend(struct.pack('d', value))
-        with open("extrema.xtr", "wb") as f:
-            f.write(serialised_data)
+            if os.path.exists("nonsym_files.list"):
+                with open("nonsym_files.list", "r") as badf:
+                    for line in badf:
+                        self.discarded_files.append(line.strip())
+                f = []
+                for file in self.files:
+                    if file not in self.discarded_files:
+                        f.append(file)
+                self.files = f
+            else:
+                self.files = self.filter_symmetric_files()
+                if rnk == 0:
+                    with open("nonsym_files.list", "w") as badf:
+                        for file in self.discarded_files:
+                            badf.write(f"{file}\n")
+            if rnk == 0:
+                print(f"Number of discarded files: {len(self.discarded_files)}")
+        if os.path.exists("extrema.xtr"):
+            self.extrema = load_extrema("extrema.xtr")
+        else:
+            self.extrema = self.find_extrema()
+            if rnk == 0:
+                serialised_data = bytearray()
+                for value in self.extrema.values():
+                    serialised_data.extend(struct.pack('d', value))
+                with open("extrema.xtr", "wb") as f:
+                    f.write(serialised_data)
+        print(f"Number of files: {len(self.files)}")
+        print(f"Data Extremes:\n{self.extrema}")
 
     def __len__(self):
         return len(self.files)
@@ -187,7 +217,14 @@ class DFFRDataset(Dataset):
 
 
 class DiffusionModel:
-    def __init__(self, T: int, model: nn.Module, width: int = 256, height: int = 256, num_channels: int = 1, device: str = "cpu"):
+    def __init__(self,
+                 T: int,
+                 model: nn.Module,
+                 width: int = 256,
+                 height: int = 256,
+                 num_channels: int = 1,
+                 device="cpu",
+                 rnk=0):
         self.T = T
         self.model = model
         self.width = width
@@ -203,7 +240,8 @@ class DiffusionModel:
         signal.signal(signal.SIGINT, self.handle_signal)
         signal.signal(signal.SIGTERM, self.handle_signal)
         signal.signal(signal.SIGQUIT, self.handle_signal)
-        self.rank = dist.get_rank() if dist.is_initialized() else 0  # Get the rank of the process
+        # self.rank = dist.get_rank() if dist.is_initialized() else 0  # Get the rank of the process
+        self.rank = rnk
 
     def handle_signal(self, signum, frame):
         print(f"Received signal {signum}. Saving model...")
@@ -212,7 +250,7 @@ class DiffusionModel:
 
     def save_model(self):
         if self.rank == 0:  # Only save the model from process with rank 0
-            torch.save(self.model.state_dict(), "interrupted_model.pth")
+            torch.save(self.model.state_dict(), f"interrupted_model_{self.rank}.pth")
             print(f"Model saved.")
 
     def train(self, dataloader, optimiser, num_epochs=10_000, csv_f="losses.csv", model_path="model.pth", accumulation_steps=4):
@@ -240,7 +278,7 @@ class DiffusionModel:
             if self.rank == 0 and epoch % 100 == 0:
                 print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item()}", flush=True)
                 cf.write(f"{epoch},{loss.item()}\n")
-                if epoch % 1_000 == 0:
+                if epoch % 10_000 == 0:
                     torch.save(self.model.state_dict(), f"model_epoch{epoch}.pth")
 
         if dist.is_initialized():
@@ -280,9 +318,17 @@ class DiffusionModel:
         return x, params
 
 
+'''
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = str(62195 + rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+'''
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = os.environ.get('SLURM_LAUNCH_NODE_IPADDR', 'localhost')
+    os.environ['MASTER_PORT'] = str(12355 + int(os.environ.get('SLURM_PROCID', '0')))
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 
@@ -295,7 +341,7 @@ def train(rank, world_size, data_dir, sym_threshold, T, batch_size, lr, epochs):
     setup(rank, world_size)
     device = torch.device(f'cuda:{rank}')
 
-    dataset = DFFRDataset(data_dir, device, threshold=sym_threshold)
+    dataset = DFFRDataset(data_dir, device, threshold=sym_threshold, rnk=rank)
     train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
     infinite_dataloader = cycle(dataloader)
@@ -303,9 +349,11 @@ def train(rank, world_size, data_dir, sym_threshold, T, batch_size, lr, epochs):
     model = UNet().to(device)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
-    diff_model = DiffusionModel(T, model, width=256, height=256, device=device)
+    diff_model = DiffusionModel(T, model, width=256, height=256, device=device, rnk=rank)
 
     optim = torch.optim.Adam(model.parameters(), lr=lr)
+
+    print(f"Starting training for process with rank {rank}...")
 
     diff_model.train(infinite_dataloader, optim, num_epochs=epochs, accumulation_steps=4)
 
@@ -314,10 +362,12 @@ def train(rank, world_size, data_dir, sym_threshold, T, batch_size, lr, epochs):
 
 def main_multi_gpu():
     print("Multi-GPU execution.")
+    with open(f"{os.getpid()}.pid", 'w') as f:
+        f.write(f"{os.getpid()}\n")
     data_dir = "data/"
     sym_threshold = 1e-5
     T = 1_000
-    batch_size = 16  # Adjust based on GPU memory
+    batch_size = 1  # Adjust based on GPU memory
     lr = 1e-5
     epochs = 100_000
 
@@ -330,7 +380,7 @@ def main_multi_gpu():
     model.load_state_dict(torch.load('model.pth'))
     diff_model = DiffusionModel(T, model, width=256, height=256, device=device)
 
-    num_samples = 20
+    num_samples = 1
     samples, params = diff_model.sample(num_samples)
 
     counter = 0
@@ -346,13 +396,13 @@ def main_single_gpu():
     print("Single/zero-GPU execution.")
     data_dir = "data/"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sym_threshold = -1e-5
+    sym_threshold = 1e-5
     dataset = DFFRDataset(data_dir, device, threshold=sym_threshold)
-    batch_size = 4  # Reduced batch size
+    batch_size = 2  # Reduced batch size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     infinite_dataloader = cycle(dataloader)
 
-    # sys.exit(0)
+    sys.exit(0)
 
     T = 1_000
 
@@ -385,8 +435,11 @@ def main_single_gpu():
 
 def main():
     if torch.cuda.device_count() > 1:
+        print(f"Multi-GPU\nNum. devices: {torch.cuda.device_count()}")
+        # main_single_gpu()
         main_multi_gpu()
     else:
+        print("Single GPU")
         main_single_gpu()
 
 
