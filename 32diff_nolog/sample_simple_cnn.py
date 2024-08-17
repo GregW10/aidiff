@@ -73,7 +73,6 @@ def main():
     model.eval()
     with torch.no_grad():
         samples = model(normed_params)
-        samples = samples*extrema["intensity_max"]
 
     for i in range(num_samples):
         plt.imshow(samples[i][0].cpu().numpy(), cmap="gray")

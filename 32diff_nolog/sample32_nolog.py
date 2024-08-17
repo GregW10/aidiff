@@ -3,7 +3,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 import struct
-from unet256_nolog import UNet
+from unet32_nolog import UNet
 from tqdm import tqdm
 import os
 import sys
@@ -18,7 +18,13 @@ def lognormal_to_gauss(mu_ln: float, sigma_ln: float) -> tuple[float, float]:
 
 
 class DiffusionModel:
-    def __init__(self, T: int, model: nn.Module, width: int = 256, height: int = 256, num_channels: int = 1, device: str = "cpu"):
+    def __init__(self,
+                 T: int,
+                 model: nn.Module,
+                 width: int = 32,
+                 height: int = 32,
+                 num_channels: int = 1,
+                 device: str = "cpu"):
         self.T = T
         self.model = model
         self.width = width
@@ -74,7 +80,7 @@ def main():
     model = UNet().to(device)
     model.load_state_dict(torch.load('model.pth'))
     extrema = load_extrema("extrema.xtr")
-    diff_model = DiffusionModel(T=1_000, model=model, width=256, height=256, device=device)
+    diff_model = DiffusionModel(T=1_000, model=model, width=32, height=32, device=device)
 
     num_samples = 20
     samples, params = diff_model.sample(extrema, num_samples=num_samples)

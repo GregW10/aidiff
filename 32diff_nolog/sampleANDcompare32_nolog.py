@@ -3,7 +3,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 import struct
-from simple_cnn import SimpleCNN
+from unet32_nolog import UNet
 from tqdm import tqdm
 import os
 import sys
@@ -18,12 +18,76 @@ def lognormal_to_gauss(mu_ln: float, sigma_ln: float) -> tuple[float, float]:
     return (math.log(mu_ln / math.sqrt(squared_p1)), math.sqrt(math.log(squared_p1)))
 
 
+class DiffusionModel:
+    def __init__(self,
+                 T: int,
+                 model: nn.Module,
+                 width: int = 32,
+                 height: int = 32,
+                 num_channels: int = 1,
+                 device: str = "cpu"):
+        self.T = T
+        self.model = model
+        self.width = width
+        self.height = height
+        self.num_channels = num_channels
+        self.device = device
+
+        self.betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device)
+        self.alphas = (1 - self.betas).to(device)
+        self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
+
+    @torch.no_grad()
+    def sample(self, extrema, num_samples=1, params=None):
+        if params is None:
+            mu, sig = lognormal_to_gauss(0.005, 5)
+            muz, sigz = lognormal_to_gauss(0.005, 5)
+            params = torch.zeros(size=(num_samples, 3), device=self.device)
+            for i in range(num_samples):
+                ap = np.random.lognormal(mean=mu, sigma=sig)
+                wav = np.random.lognormal(mean=mu, sigma=sig)
+                while wav > ap or wav*20 < ap:
+                    ap = np.random.lognormal(mean=mu, sigma=sig)
+                    wav = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=muz, sigma=sigz)
+                params[i][0] = ap
+                params[i][1] = wav
+                params[i][2] = zd
+        normed_params = params.clone()
+        normed_params[:, 0] /= extrema["aperture_max"]
+        normed_params[:, 1] /= extrema["wavelength_max"]
+        normed_params[:, 2] /= extrema["distance_max"]
+        x = torch.randn((num_samples, self.num_channels, self.width, self.height)).to(self.device)
+        pfunc = tqdm if os.isatty(sys.stdout.fileno()) else lambda x: x
+
+        for t in pfunc(range(self.T, 0, -1)):
+            z = torch.randn_like(x).to(self.device) if t > 1 else torch.zeros_like(x).to(self.device)
+            x = (1 / torch.sqrt(self.alphas[t - 1, None, None, None]) * \
+                 (x - ((1 - self.alphas[t - 1, None, None, None]) / torch.sqrt(1 - self.bar_alphas[t - 1, None, None, None])) * self.model(x, torch.Tensor([t] * num_samples).to(self.device), normed_params)) + \
+                 torch.sqrt(self.betas[t - 1, None, None, None]) * z)
+        return x*extrema["intensity_max"], params
+
+
 def load_extrema(file_path):
     with open(file_path, "rb") as f:
         data = f.read()
     extrema_values = struct.unpack('d' * (len(data) // 8), data)
     extrema_keys = ["intensity_min", "intensity_max", "aperture_min", "aperture_max", "wavelength_min", "wavelength_max", "distance_min", "distance_max"]
     return dict(zip(extrema_keys, extrema_values))
+
+"""
+def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, output_bmp_path):
+    command = [
+        "dffrcc", "--nx", "32", "--ny", "32", "--lam", str(wavelength),
+        "--xa", str(-aperture/2), "--xb", str(aperture/2),
+        "--ya", str(-aperture/2), "--yb", str(aperture/2),
+        "--z", str(distance), "--w", str(1.5 * distance), "--l", str(1.5 * distance),
+        "--I0", "10000", "--ptol_x", "1e-15", "--ptol_y", "1e-15", "--atol_x", "1e-10", "--atol_y", "1e-10",
+        "--rtol_x", "1e-10", "--rtol_y", "1e-10", "-f", "lf",
+        "--dffr", output_dffr_path, "--bmp", output_bmp_path, "--ptime", "1", "--cmap", "grayscale"
+    ]
+    subprocess.run(command, check=True)
+"""
 
 
 def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, output_bmp_path):
@@ -58,7 +122,7 @@ def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, outp
         wl = one_p5_apl
 
     command = [
-        "dffrcc", "--nx", "256", "--ny", "256", "--lam", str(wavelength),
+        "dffrcc", "--nx", "32", "--ny", "32", "--lam", str(wavelength),
         "--xa", str(-aperture/2), "--xb", str(aperture/2),
         "--ya", str(-aperture/2), "--yb", str(aperture/2),
         "--z", str(distance), "--w", str(wl), "--l", str(wl),
@@ -96,7 +160,8 @@ def load_dffr(file_path):
         data = np.fromfile(f, dtype=np.float64).reshape((vertical_resolution, horizontal_resolution))
     return data
 
-def save_dffr(file_path, data, params, detector_size=256):
+
+def save_dffr(file_path, data, params, detector_size=32):
     with open(file_path, "wb") as f:
         # Header and metadata
         f.write(b'DFFR')
@@ -118,54 +183,30 @@ def save_dffr(file_path, data, params, detector_size=256):
         # Intensity data
         data.tofile(f)
 
+
 def l2_true_distance(pattern1, pattern2):
     return np.linalg.norm(pattern1 - pattern2)
+
 
 def l2_norm_distance(pattern1, pattern2):
     return np.linalg.norm((pattern1/np.max(pattern1)) - (pattern2/np.max(pattern2)))
 
-def generate_random_params(extrema, num_samples=1):
-    mu, sig = lognormal_to_gauss(0.005, 5)
-    muz, sigz = lognormal_to_gauss(0.01, 4)
-    params = torch.zeros(size=(num_samples, 3))
-    for i in range(num_samples):
-        ap = np.random.lognormal(mean=mu, sigma=sig)
-        wav = np.random.lognormal(mean=mu, sigma=sig)
-        while wav > ap or wav*20 < ap:
-            ap = np.random.lognormal(mean=mu, sigma=sig)
-            wav = np.random.lognormal(mean=mu, sigma=sig)
-        zd = np.random.lognormal(mean=muz, sigma=sigz)
-        params[i][0] = ap
-        params[i][1] = wav
-        params[i][2] = zd
-    return params
-
-def normalize_params(params, extrema):
-    normed_params = params.clone()
-    normed_params[:, 0] /= extrema["aperture_max"]
-    normed_params[:, 1] /= extrema["wavelength_max"]
-    normed_params[:, 2] /= extrema["distance_max"]
-    return normed_params
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = SimpleCNN().to(device)
-    model.load_state_dict(torch.load('simple_cnn.pth', map_location=torch.device(device)))
+    model = UNet().to(device)
+    model.load_state_dict(torch.load('model.pth'))
     extrema = load_extrema("extrema.xtr")
+    print(f"Extrema are:\n{extrema}")
+    diff_model = DiffusionModel(T=1_000, model=model, width=32, height=32, device=device)
 
-    num_samples = 20
-    params = generate_random_params(extrema, num_samples=num_samples)
-    normed_params = normalize_params(params, extrema).to(device)
-
-    model.eval()
-    with torch.no_grad():
-        samples = model(normed_params)
-        samples = samples*extrema["intensity_max"]
-
+    num_samples = 1
+    samples, params = diff_model.sample(extrema, num_samples=num_samples)
+    
     total_true_distance = 0.0
     total_norm_distance = 0.0
 
-    f = open("distances_simple_cnn.csv", "w")
+    f = open("distances.csv", "w")
     f.write("aperture_size,wavelength,distance,true_distance,norm_distance\n")
 
     for i in range(num_samples):
@@ -174,10 +215,10 @@ def main():
         dist = params[i][2].item()
 
         # Generate paths for the output files
-        model_dffr_path = f"model_simple_cnn_ap{ap}_wav{wav}_dist{dist}.dffr"
-        model_bmp_path = f"model_simple_cnn_ap{ap}_wav{wav}_dist{dist}.bmp"
-        dffrcc_dffr_path = f"dffrcc_simple_cnn_ap{ap}_wav{wav}_dist{dist}.dffr"
-        dffrcc_bmp_path = f"dffrcc_simple_cnn_ap{ap}_wav{wav}_dist{dist}.bmp"
+        model_dffr_path = f"model_ap{ap}_wav{wav}_dist{dist}.dffr"
+        model_bmp_path = f"model_ap{ap}_wav{wav}_dist{dist}.bmp"
+        dffrcc_dffr_path = f"dffrcc_ap{ap}_wav{wav}_dist{dist}.dffr"
+        dffrcc_bmp_path = f"dffrcc_ap{ap}_wav{wav}_dist{dist}.bmp"
 
         # Save model-generated data as .dffr file
         model_pattern = samples[i][0].cpu().numpy()
@@ -207,13 +248,14 @@ def main():
         axes[1].imshow(dffrcc_pattern, cmap="gray")
         axes[1].set_title("dffrcc-Generated")
         plt.suptitle(f"Aperture: {ap} m, Wavelength: {wav} m,\nDistance: {dist} m")
-        plt.savefig(f"comparison_simple_cnn_ap{ap}_wav{wav}_dist{dist}.png")
+        plt.savefig(f"comparison_ap{ap}_wav{wav}_dist{dist}.png")
         plt.close()
 
     print(f"Average L2 True Distance: {total_true_distance / num_samples}")
     print(f"Average L2 Norm. Distance: {total_norm_distance / num_samples}")
 
     f.close()
+
 
 if __name__ == "__main__":
     main()

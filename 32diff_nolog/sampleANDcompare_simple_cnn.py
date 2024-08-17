@@ -160,7 +160,6 @@ def main():
     model.eval()
     with torch.no_grad():
         samples = model(normed_params)
-        samples = samples*extrema["intensity_max"]
 
     total_true_distance = 0.0
     total_norm_distance = 0.0

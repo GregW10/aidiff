@@ -6,7 +6,7 @@ import sys
 from itertools import cycle
 from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
-from unet256_nolog import UNet
+from unet32_nolog import UNet
 from tqdm import tqdm
 import numpy as np
 import struct
@@ -42,6 +42,14 @@ def is_symmetric(image, threshold=0.001):
     symm_ynegx = np.abs(image - flipped_ud.T).mean()
     
     return symm_yx < threshold and symm_ynegx < threshold
+
+
+def average_pooling(data, size=32):
+    """
+    Downsample the data from 256x256 to size x size using average pooling.
+    """
+    pooled_data = data.reshape(size, data.shape[0] // size, size, data.shape[1] // size).mean(axis=(1, 3))
+    return pooled_data
 
 
 def load_extrema(file_path):
@@ -120,6 +128,8 @@ class DFFRDataset(Dataset):
 
         assert data.shape == (256, 256), "Shape is not 256x256"
 
+        data = average_pooling(data, 32)
+
         # norm_data = (data - self.extrema['intensity_min']) / (self.extrema['intensity_max'] - self.extrema['intensity_min'])
         # norm_params = np.array([
         #     (aperture_size - self.extrema['aperture_min']) / (self.extrema['aperture_max'] - self.extrema['aperture_min']),
@@ -151,6 +161,7 @@ class DFFRDataset(Dataset):
                     continue
                 
                 data = data.reshape((256, 256))
+                data = average_pooling(data, 32)
                 if is_symmetric(data, self.threshold):
                     valid_files.append(file_path)
                 else:
@@ -195,6 +206,8 @@ class DFFRDataset(Dataset):
                 aperture_size = upper_x_limit - lower_x_limit
                 data = np.fromfile(f, dtype=np.float64).reshape((vertical_resolution, horizontal_resolution))
 
+                data = average_pooling(data, 32)
+
                 intensity_min = min(intensity_min, np.min(data))
                 intensity_max = max(intensity_max, np.max(data))
                 aperture_min = min(aperture_min, aperture_size)
@@ -220,8 +233,8 @@ class DiffusionModel:
     def __init__(self,
                  T: int,
                  model: nn.Module,
-                 width: int = 256,
-                 height: int = 256,
+                 width: int = 32,
+                 height: int = 32,
                  num_channels: int = 1,
                  device="cpu",
                  rnk=0):
@@ -287,7 +300,7 @@ class DiffusionModel:
             cf.close()
             torch.save(self.model.state_dict(), model_path)
 
-    @torch.no_grad
+    @torch.no_grad()
     def sample(self, dataset: DFFRDataset, num_samples=1, params=None):
         if params is None:
             # params = torch.tensor([[0.5, 500e-9, 1.0]] * num_samples).to(self.device)  # Example parameters
@@ -349,7 +362,7 @@ def train(rank, world_size, data_dir, sym_threshold, T, batch_size, lr, epochs):
     model = UNet().to(device)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
-    diff_model = DiffusionModel(T, model, width=256, height=256, device=device, rnk=rank)
+    diff_model = DiffusionModel(T, model, width=32, height=32, device=device, rnk=rank)
 
     optim = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -378,7 +391,7 @@ def main_multi_gpu():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = UNet().to(device)
     model.load_state_dict(torch.load('model.pth'))
-    diff_model = DiffusionModel(T, model, width=256, height=256, device=device)
+    diff_model = DiffusionModel(T, model, width=32, height=32, device=device)
 
     num_samples = 1
     samples, params = diff_model.sample(num_samples)
@@ -411,7 +424,7 @@ def main_single_gpu():
     if len(sys.argv) > 1:
         model.load_state_dict(torch.load(sys.argv[1]))
 
-    diff_model = DiffusionModel(T, model, width=256, height=256, device=device)
+    diff_model = DiffusionModel(T, model, width=32, height=32, device=device)
 
     lr = 1e-5
     optim = torch.optim.Adam(model.parameters(), lr=lr)
