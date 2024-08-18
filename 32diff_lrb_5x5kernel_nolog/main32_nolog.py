@@ -230,25 +230,31 @@ class DFFRDataset(Dataset):
         }
 
 
-class DiffusionModel:
+class DiffusionModel(nn.Module):
     def __init__(self,
                  T: int,
-                 model: nn.Module,
                  width: int = 32,
                  height: int = 32,
                  num_channels: int = 1,
                  device="cpu",
                  rnk=0):
+        super(DiffusionModel, self).__init__()
         self.T = T
-        self.model = model
+        self.model = UNet().to(device)
         self.width = width
         self.height = height
         self.num_channels = num_channels
         self.device = device
 
-        self.betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device)
-        self.alphas = (1 - self.betas).to(device)
-        self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
+        # self.betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device)
+        # self.alphas = (1 - self.betas).to(device)
+        # self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
+
+        # Define betas as a learnable parameter
+        self.betas = nn.Parameter(torch.linspace(start=0.0001, end=0.02, steps=T, device=device))
+
+        self.register_buffer('alphas', (1 - self.betas).to(device))  # Alphas depend on betas
+        self.register_buffer('bar_alphas', torch.cumprod(self.alphas, dim=0).to(device))
 
         signal.signal(signal.SIGHUP, self.handle_signal)
         signal.signal(signal.SIGINT, self.handle_signal)
@@ -264,13 +270,16 @@ class DiffusionModel:
 
     def save_model(self):
         if self.rank == 0:  # Only save the model from process with rank 0
-            torch.save(self.model.state_dict(), f"interrupted_model_{self.rank}.pth")
+            torch.save(self.state_dict(), f"interrupted_model_{self.rank}.pth")
             print(f"Model saved.")
 
     def train(self, dataloader, optimiser, num_epochs=10_000, csv_f="losses.csv", model_path="model.pth", accumulation_steps=4):
         if self.rank == 0:
-            model_dir = f"model_chkps{int(time.time())}"
+            _tt = int(time.time())
+            model_dir = f"model_chkps{_tt}"
+            noise_dir = f"noise_{_tt}"
             os.mkdir(model_dir)
+            os.mkdir(noise_dir)
         if self.rank == 0:
             cf = open(csv_f, "w")
             cf.write("epoch,iteration,loss\n")
@@ -289,6 +298,10 @@ class DiffusionModel:
             for iteration, (x_0, params) in enumerate(dataloader, start=1):
                 # for _ in range(accumulation_steps):
                 # x_0, params = next(dataloader)
+
+                self.alphas = ((1 - self.betas).to(self.device))
+                self.bar_alphas = (torch.cumprod(self.alphas, dim=0).to(self.device))
+
                 x_0 = x_0.to(self.device)
                 params = params.to(self.device)
                 t = torch.randint(low=1, high=self.T + 1, size=(x_0.size(0),)).to(self.device)
@@ -305,26 +318,40 @@ class DiffusionModel:
                 if self.rank == 0 and iteration % 100 == 0:
                     print(f"Epoch {epoch}/{num_epochs}, it. {iteration}/{num_its}, Loss: {loss.item()}", flush=True)
                     cf.write(f"{epoch},{iteration},{loss.item()}\n")
-                    if iteration % 100 == 0:
-                        torch.save(self.model.state_dict(),
-                                   f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
+                    # if iteration % 100 == 0:
+                    #     torch.save(self.state_dict(),
+                    #                f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
+
+                    if iteration % 10_000 == 0:
+                        for (x0v, xtv, tv) in zip(x_0, x_t, t):
+                            fig, axes = plt.subplots(1, 2)
+                            axes[0].imshow(x0v[0].cpu().detach().numpy(), cmap="gray")
+                            axes[0].set_title("t = 0")
+                            axes[1].imshow(xtv[0].cpu().detach().numpy(), cmap="gray")
+                            axes[1].set_title(f"t = {tv.item()}")
+                            fig.savefig(f"{noise_dir}/epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}_t{tv.item()}.png", dpi=600)
+                            plt.clf()
+                            plt.close()
 
                 last_iter = iteration
 
             actual_acums = last_iter % accumulation_steps
 
             if actual_acums != 0:
-                for par in self.model.parameters():
+                for par in self.parameters():
                     if par.grad is not None:
                         par.grad.data.mul_(accumulation_steps/actual_acums)
                 optimiser.step()
                 optimiser.zero_grad()
 
+            if self.rank == 0:
+                torch.save(self.state_dict(), f"{model_dir}/model_epoch{epoch:0{elen}d}.pth")
+
         if dist.is_initialized():
             dist.barrier()
         if self.rank == 0:
             cf.close()
-            torch.save(self.model.state_dict(), f"{model_dir}/model_path")
+            torch.save(self.state_dict(), f"{model_dir}/model_path")
 
     @torch.no_grad()
     def sample(self, dataset: DFFRDataset, num_samples=1, params=None):
@@ -415,9 +442,8 @@ def main_multi_gpu():
 
     # Sampling part can be done separately after training
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = UNet().to(device)
-    model.load_state_dict(torch.load('model.pth'))
-    diff_model = DiffusionModel(T, model, width=32, height=32, device=device)
+    diff_model = DiffusionModel(T, width=32, height=32, device=device)
+    diff_model.load_state_dict(torch.load('model.pth'))
 
     num_samples = 1
     samples, params = diff_model.sample(num_samples)
@@ -437,7 +463,7 @@ def main_single_gpu():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sym_threshold = 1e-6
     dataset = DFFRDataset(data_dir, device, threshold=sym_threshold)
-    batch_size = 2  # Reduced batch size
+    batch_size = 4  # Reduced batch size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     # infinite_dataloader = cycle(dataloader)
 
@@ -445,15 +471,17 @@ def main_single_gpu():
 
     T = 1_000
 
-    model = UNet().to(device)
+    # model = UNet().to(device)
+
+    diff_model = DiffusionModel(T, width=32, height=32, device=device)
 
     if len(sys.argv) > 1:
-        model.load_state_dict(torch.load(sys.argv[1]))
-
-    diff_model = DiffusionModel(T, model, width=32, height=32, device=device)
+        diff_model.load_state_dict(torch.load(sys.argv[1]))
 
     lr = 1e-5
-    optim = torch.optim.Adam(model.parameters(), lr=lr)
+    # optim = torch.optim.Adam(model.parameters(), lr=lr)
+    optim = torch.optim.Adam(diff_model.parameters(), lr=lr)
+
     epochs = 100_000
 
     acc_steps = 4

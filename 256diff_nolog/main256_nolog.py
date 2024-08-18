@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import math
+import time
 
 
 def lognormal_to_gauss(mu_ln: float, sigma_ln: float) -> tuple[float, float]:
@@ -255,15 +256,26 @@ class DiffusionModel:
 
     def train(self, dataloader, optimiser, num_epochs=10_000, csv_f="losses.csv", model_path="model.pth", accumulation_steps=4):
         if self.rank == 0:
+            model_dir = f"model_chkps{int(time.time())}"
+            os.mkdir(model_dir)
+        if self.rank == 0:
             cf = open(csv_f, "w")
-            cf.write("epoch,loss\n")
+            cf.write("epoch,iteration,loss\n")
 
-        pfunc = tqdm if (self.rank == 0 and os.isatty(sys.stdout.fileno())) else lambda x: x
+        # pfunc = tqdm if (self.rank == 0 and os.isatty(sys.stdout.fileno())) else lambda x: x
 
-        for epoch in pfunc(range(1, num_epochs + 1)):
-            optimiser.zero_grad()
-            for _ in range(accumulation_steps):
-                x_0, params = next(dataloader)
+        optimiser.zero_grad()
+
+        num_its = len(dataloader)
+
+        elen = len(str(num_epochs))
+        dlen = len(str(num_its))
+
+        for epoch in range(1, num_epochs + 1):
+            last_iter = 0
+            for iteration, (x_0, params) in enumerate(dataloader, start=1):
+                # for _ in range(accumulation_steps):
+                # x_0, params = next(dataloader)
                 x_0 = x_0.to(self.device)
                 params = params.to(self.device)
                 t = torch.randint(low=1, high=self.T + 1, size=(x_0.size(0),)).to(self.device)
@@ -273,21 +285,35 @@ class DiffusionModel:
 
                 loss.backward()
 
-            optimiser.step()
+                if iteration % accumulation_steps == 0:
+                    optimiser.step()
+                    optimiser.zero_grad()
 
-            if self.rank == 0 and epoch % 100 == 0:
-                print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item()}", flush=True)
-                cf.write(f"{epoch},{loss.item()}\n")
-                if epoch % 10_000 == 0:
-                    torch.save(self.model.state_dict(), f"model_epoch{epoch}.pth")
+                if self.rank == 0 and iteration % 100 == 0:
+                    print(f"Epoch {epoch}/{num_epochs}, it. {iteration}/{num_its}, Loss: {loss.item()}", flush=True)
+                    cf.write(f"{epoch},{iteration},{loss.item()}\n")
+                    if iteration % 10_000 == 0:
+                        torch.save(self.model.state_dict(),
+                                   f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
+
+                last_iter = iteration
+
+            actual_acums = last_iter % accumulation_steps
+
+            if actual_acums != 0:
+                for par in self.model.parameters():
+                    if par.grad is not None:
+                        par.grad.data.mul_(accumulation_steps/actual_acums)
+                optimiser.step()
+                optimiser.zero_grad()
 
         if dist.is_initialized():
             dist.barrier()
         if self.rank == 0:
             cf.close()
-            torch.save(self.model.state_dict(), model_path)
+            torch.save(self.model.state_dict(), f"{model_dir}/model_path")
 
-    @torch.no_grad
+    @torch.no_grad()
     def sample(self, dataset: DFFRDataset, num_samples=1, params=None):
         if params is None:
             # params = torch.tensor([[0.5, 500e-9, 1.0]] * num_samples).to(self.device)  # Example parameters
@@ -400,7 +426,7 @@ def main_single_gpu():
     dataset = DFFRDataset(data_dir, device, threshold=sym_threshold)
     batch_size = 2  # Reduced batch size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    infinite_dataloader = cycle(dataloader)
+    # infinite_dataloader = cycle(dataloader)
 
     # sys.exit(0)
 
@@ -419,7 +445,7 @@ def main_single_gpu():
 
     acc_steps = 4
 
-    diff_model.train(infinite_dataloader, optim, num_epochs=epochs, accumulation_steps=acc_steps)
+    diff_model.train(dataloader, optim, num_epochs=epochs, accumulation_steps=acc_steps)
 
     num_samples = 20
     samples, params = diff_model.sample(num_samples)
