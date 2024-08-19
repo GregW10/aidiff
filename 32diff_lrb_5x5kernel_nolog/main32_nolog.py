@@ -6,7 +6,7 @@ import sys
 from itertools import cycle
 from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
-from unet32_nolog import UNet
+from unet32_5x5 import UNet
 from tqdm import tqdm
 import numpy as np
 import struct
@@ -131,13 +131,6 @@ class DFFRDataset(Dataset):
 
         data = average_pooling(data, 32)
 
-        # norm_data = (data - self.extrema['intensity_min']) / (self.extrema['intensity_max'] - self.extrema['intensity_min'])
-        # norm_params = np.array([
-        #     (aperture_size - self.extrema['aperture_min']) / (self.extrema['aperture_max'] - self.extrema['aperture_min']),
-        #     (wavelength - self.extrema['wavelength_min']) / (self.extrema['wavelength_max'] - self.extrema['wavelength_min']),
-        #     (z_distance - self.extrema['distance_min']) / (self.extrema['distance_max'] - self.extrema['distance_min'])
-        # ])
-
         norm_data = data / self.extrema['intensity_max']
         norm_params = np.array([
             aperture_size / self.extrema['aperture_max'],
@@ -230,6 +223,11 @@ class DFFRDataset(Dataset):
         }
 
 
+# Inverse sigmoid function
+def inverse_sigmoid(y):
+    return np.log(y / (1 - y))
+
+
 class DiffusionModel(nn.Module):
     def __init__(self,
                  T: int,
@@ -237,6 +235,7 @@ class DiffusionModel(nn.Module):
                  height: int = 32,
                  num_channels: int = 1,
                  device="cpu",
+                 l2_lam=1e-4,
                  rnk=0):
         super(DiffusionModel, self).__init__()
         self.T = T
@@ -245,21 +244,33 @@ class DiffusionModel(nn.Module):
         self.height = height
         self.num_channels = num_channels
         self.device = device
+        self.l2_lam = l2_lam
 
         # self.betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device)
         # self.alphas = (1 - self.betas).to(device)
         # self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
 
-        # Define betas as a learnable parameter
-        self.betas = nn.Parameter(torch.linspace(start=0.0001, end=0.02, steps=T, device=device))
+        target_array = np.linspace(start=0.0001, stop=0.02, num=T)
+        inv_array = inverse_sigmoid(target_array)
 
-        self.register_buffer('alphas', (1 - self.betas).to(device))  # Alphas depend on betas
-        self.register_buffer('bar_alphas', torch.cumprod(self.alphas, dim=0).to(device))
+        self.raw_betas = nn.Parameter(torch.tensor(inv_array, dtype=torch.float32), requires_grad=True)
 
-        signal.signal(signal.SIGHUP, self.handle_signal)
-        signal.signal(signal.SIGINT, self.handle_signal)
-        signal.signal(signal.SIGTERM, self.handle_signal)
-        signal.signal(signal.SIGQUIT, self.handle_signal)
+        # Define betas as a learnable parameter, I initialise with DDPMs paper values
+        # self.betas = nn.Parameter(torch.linspace(start=0.0001, end=0.02, steps=T, device=device))
+        # self.register_buffer("betas", torch.nn.functional.sigmoid(self.raw_betas).to(device))
+        # self.betas = torch.nn.functional.sigmoid(self.raw_betas).to(device)
+
+        # self.register_buffer('alphas', (1 - self.betas).to(device))  # Alphas depend on betas
+        # self.register_buffer('bar_alphas', torch.cumprod(self.alphas, dim=0).to(device))
+        # self.alphas = (1 - self.betas).to(device)
+        # self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
+
+        if rnk == 0 and __name__ == "__main__":
+            signal.signal(signal.SIGHUP, self.handle_signal)
+            signal.signal(signal.SIGINT, self.handle_signal)
+            signal.signal(signal.SIGTERM, self.handle_signal)
+            signal.signal(signal.SIGQUIT, self.handle_signal)
+
         # self.rank = dist.get_rank() if dist.is_initialized() else 0  # Get the rank of the process
         self.rank = rnk
 
@@ -273,13 +284,22 @@ class DiffusionModel(nn.Module):
             torch.save(self.state_dict(), f"interrupted_model_{self.rank}.pth")
             print(f"Model saved.")
 
-    def train(self, dataloader, optimiser, num_epochs=10_000, csv_f="losses.csv", model_path="model.pth", accumulation_steps=4):
+    def train(self,
+              dataloader,
+              lr=1e-5,
+              num_epochs=10_000,
+              csv_f="losses.csv",
+              model_path="model.pth",
+              accumulation_steps=4):
+        optimiser = torch.optim.Adam(self.parameters(), lr=lr)
         if self.rank == 0:
             _tt = int(time.time())
             model_dir = f"model_chkps{_tt}"
             noise_dir = f"noise_{_tt}"
+            betas_dir = f"betas_{_tt}"
             os.mkdir(model_dir)
             os.mkdir(noise_dir)
+            os.mkdir(betas_dir)
         if self.rank == 0:
             cf = open(csv_f, "w")
             cf.write("epoch,iteration,loss\n")
@@ -293,27 +313,48 @@ class DiffusionModel(nn.Module):
         elen = len(str(num_epochs))
         dlen = len(str(num_its))
 
+        acloss = torch.tensor(0.0, device=self.device)
+        accs = 0
+
+        betas = torch.nn.functional.sigmoid(self.raw_betas).to(self.device)
+        alphas = (1 - betas).to(self.device)
+        bar_alphas = torch.cumprod(alphas, dim=0).to(self.device)
+
         for epoch in range(1, num_epochs + 1):
-            last_iter = 0
+            # last_iter = 0
             for iteration, (x_0, params) in enumerate(dataloader, start=1):
                 # for _ in range(accumulation_steps):
                 # x_0, params = next(dataloader)
-
-                self.alphas = ((1 - self.betas).to(self.device))
-                self.bar_alphas = (torch.cumprod(self.alphas, dim=0).to(self.device))
 
                 x_0 = x_0.to(self.device)
                 params = params.to(self.device)
                 t = torch.randint(low=1, high=self.T + 1, size=(x_0.size(0),)).to(self.device)
                 eps = torch.randn_like(x_0).to(self.device)
-                x_t = torch.sqrt(self.bar_alphas[t - 1, None, None, None]) * x_0 + torch.sqrt(1 - self.bar_alphas[t - 1, None, None, None]) * eps
-                loss = torch.nn.functional.mse_loss(self.model(x_t, t, params), eps) / accumulation_steps
+                x_t = torch.sqrt(bar_alphas[t - 1, None, None, None]) * x_0 + torch.sqrt(1 - bar_alphas[t - 1, None, None, None]) * eps
+                # loss = torch.nn.functional.mse_loss(self.model(x_t, t, params), eps) / accumulation_steps
+                loss = torch.nn.functional.mse_loss(self.model(x_t, t, params), eps)
 
-                loss.backward()
+                # loss.backward()
 
-                if iteration % accumulation_steps == 0:
+                acloss += loss  # torch.nn.functional.mse_loss(self.model(x_t, t, params), eps)
+                accs += 1
+
+                if accs == accumulation_steps:
+                    acloss /= accumulation_steps
+                    beta_regloss = self.l2_lam*torch.sum(betas**2)
+                    acloss += beta_regloss
+
+                    acloss.backward()
+
                     optimiser.step()
                     optimiser.zero_grad()
+
+                    betas = nn.functional.sigmoid(self.raw_betas).to(self.device)
+                    alphas = ((1 - betas).to(self.device))
+                    bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
+
+                    acloss = torch.tensor(0.0, device=self.device)
+                    accs = 0
 
                 if self.rank == 0 and iteration % 100 == 0:
                     print(f"Epoch {epoch}/{num_epochs}, it. {iteration}/{num_its}, Loss: {loss.item()}", flush=True)
@@ -321,6 +362,10 @@ class DiffusionModel(nn.Module):
                     # if iteration % 100 == 0:
                     #     torch.save(self.state_dict(),
                     #                f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
+                    self.raw_betas.cpu().detach().numpy().tofile(
+                        f"{betas_dir}/rawbetas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.rbetas")
+                    betas.cpu().detach().numpy().tofile(
+                        f"{betas_dir}/betas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.betas")
 
                     if iteration % 10_000 == 0:
                         for (x0v, xtv, tv) in zip(x_0, x_t, t):
@@ -333,16 +378,27 @@ class DiffusionModel(nn.Module):
                             plt.clf()
                             plt.close()
 
-                last_iter = iteration
+            # actual_acums = last_iter % accumulation_steps
 
-            actual_acums = last_iter % accumulation_steps
+            if accs != 0:
+                # for par in self.parameters():
+                #     if par.grad is not None:
+                #         par.grad.data.mul_(accumulation_steps/actual_acums)
+                acloss /= accs
+                beta_regloss = self.l2_lam*torch.sum(betas**2)
+                acloss += beta_regloss
 
-            if actual_acums != 0:
-                for par in self.parameters():
-                    if par.grad is not None:
-                        par.grad.data.mul_(accumulation_steps/actual_acums)
+                acloss.backward()
+
                 optimiser.step()
                 optimiser.zero_grad()
+
+                betas = nn.functional.sigmoid(self.raw_betas)
+                alphas = ((1 - betas).to(self.device))
+                bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
+
+                acloss = torch.tensor(0.0, device=self.device)
+                accs = 0
 
             if self.rank == 0:
                 torch.save(self.state_dict(), f"{model_dir}/model_epoch{epoch:0{elen}d}.pth")
@@ -354,10 +410,13 @@ class DiffusionModel(nn.Module):
             torch.save(self.state_dict(), f"{model_dir}/model_path")
 
     @torch.no_grad()
-    def sample(self, dataset: DFFRDataset, num_samples=1, params=None):
+    def sample(self, extrema, num_samples=1, params=None):
+        betas = nn.functional.sigmoid(self.raw_betas)
+        alphas = ((1 - betas).to(self.device))
+        bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
         if params is None:
-            # params = torch.tensor([[0.5, 500e-9, 1.0]] * num_samples).to(self.device)  # Example parameters
-            mu, sig = lognormal_to_gauss(0.01, 5)
+            mu, sig = lognormal_to_gauss(0.005, 5)
+            muz, sigz = lognormal_to_gauss(0.01, 4)
             params = torch.zeros(size=(num_samples, 3), device=self.device)
             for i in range(num_samples):
                 ap = np.random.lognormal(mean=mu, sigma=sig)
@@ -365,23 +424,23 @@ class DiffusionModel(nn.Module):
                 while wav > ap or wav*20 < ap:
                     ap = np.random.lognormal(mean=mu, sigma=sig)
                     wav = np.random.lognormal(mean=mu, sigma=sig)
-                zd = np.random.lognormal(mean=mu, sigma=sig)
+                zd = np.random.lognormal(mean=muz, sigma=sigz)
                 params[i][0] = ap
                 params[i][1] = wav
                 params[i][2] = zd
-        normed_params = params
-        normed_params[:, 0] /= dataset.extrema["aperture_max"]
-        normed_params[:, 1] /= dataset.extrema["wavelength_max"]
-        normed_params[:, 2] /= dataset.extrema["distance_max"]
+        normed_params = params.clone()
+        normed_params[:, 0] /= extrema["aperture_max"]
+        normed_params[:, 1] /= extrema["wavelength_max"]
+        normed_params[:, 2] /= extrema["distance_max"]
         x = torch.randn((num_samples, self.num_channels, self.height, self.width)).to(self.device)
-        pfunc = tqdm if (self.rank == 0 or not os.isatty(sys.stdout.fileno())) else lambda x: x
+        pfunc = tqdm if (self.rank == 0 and os.isatty(sys.stdout.fileno())) else lambda x: x
 
         for t in pfunc(range(self.T, 0, -1)):
             z = torch.randn_like(x).to(self.device) if t > 1 else torch.zeros_like(x).to(self.device)
-            x = (1 / torch.sqrt(self.alphas[t - 1, None, None, None]) * \
-                 (x - ((1 - self.alphas[t - 1, None, None, None]) / torch.sqrt(1 - self.bar_alphas[t - 1, None, None, None])) * self.model(x, torch.Tensor([t] * num_samples).to(self.device), normed_params)) + \
-                 torch.sqrt(self.betas[t - 1, None, None, None]) * z)
-        return x*dataset.extrema["intensity_max"], params
+            x = (1 / torch.sqrt(alphas[t - 1, None, None, None]) * \
+                 (x - ((1 - alphas[t - 1, None, None, None]) / torch.sqrt(1 - bar_alphas[t - 1, None, None, None])) * self.model(x, torch.Tensor([t] * num_samples).to(self.device), normed_params)) + \
+                 torch.sqrt(betas[t - 1, None, None, None]) * z)
+        return x*extrema["intensity_max"], params
 
 
 '''
@@ -478,18 +537,19 @@ def main_single_gpu():
     if len(sys.argv) > 1:
         diff_model.load_state_dict(torch.load(sys.argv[1]))
 
+    diff_model.l2_lam = 1e-3  # betas regularisation
+
     lr = 1e-5
     # optim = torch.optim.Adam(model.parameters(), lr=lr)
-    optim = torch.optim.Adam(diff_model.parameters(), lr=lr)
 
     epochs = 100_000
 
     acc_steps = 4
 
-    diff_model.train(dataloader, optim, num_epochs=epochs, accumulation_steps=acc_steps)
+    diff_model.train(dataloader, lr=lr, num_epochs=epochs, accumulation_steps=acc_steps)
 
     num_samples = 20
-    samples, params = diff_model.sample(num_samples)
+    samples, params = diff_model.sample(dataset.extrema, num_samples)
 
     counter = 0
     while counter < num_samples:
