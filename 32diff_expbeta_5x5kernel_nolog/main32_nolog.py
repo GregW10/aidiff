@@ -250,10 +250,18 @@ class DiffusionModel(nn.Module):
         # self.alphas = (1 - self.betas).to(device)
         # self.bar_alphas = torch.cumprod(self.alphas, dim=0).to(device)
 
-        target_array = np.linspace(start=0.0001, stop=0.02, num=T)
-        inv_array = inverse_sigmoid(target_array)
+        # target_array = np.linspace(start=0.0001, stop=0.02, num=T)
+        # inv_array = inverse_sigmoid(target_array)
 
-        self.raw_betas = nn.Parameter(torch.tensor(inv_array, dtype=torch.float32), requires_grad=True)
+        start_beta = 0.00001
+        stop_beta  = 0.025
+        steep      = 4
+
+        x = np.linspace(0, 1, 1_000)
+
+        betas = (((np.exp(steep*x) - 1)/(np.e**steep - 1)))*(stop_beta - start_beta) + start_beta
+
+        self.raw_betas = torch.tensor(betas, dtype=torch.float32)
 
         # Define betas as a learnable parameter, I initialise with DDPMs paper values
         # self.betas = nn.Parameter(torch.linspace(start=0.0001, end=0.02, steps=T, device=device))
@@ -316,7 +324,7 @@ class DiffusionModel(nn.Module):
         acloss = torch.tensor(0.0, device=self.device)
         accs = 0
 
-        betas = torch.nn.functional.sigmoid(self.raw_betas).to(self.device)
+        betas = self.raw_betas.clone()
         alphas = (1 - betas).to(self.device)
         bar_alphas = torch.cumprod(alphas, dim=0).to(self.device)
 
@@ -341,17 +349,11 @@ class DiffusionModel(nn.Module):
 
                 if accs == accumulation_steps:
                     acloss /= accumulation_steps
-                    beta_regloss = self.l2_lam*torch.sum(betas**2)
-                    acloss += beta_regloss
 
                     acloss.backward()
 
                     optimiser.step()
                     optimiser.zero_grad()
-
-                    betas = nn.functional.sigmoid(self.raw_betas).to(self.device)
-                    alphas = ((1 - betas).to(self.device))
-                    bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
 
                     acloss = torch.tensor(0.0, device=self.device)
                     accs = 0
@@ -362,10 +364,11 @@ class DiffusionModel(nn.Module):
                     # if iteration % 100 == 0:
                     #     torch.save(self.state_dict(),
                     #                f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
-                    self.raw_betas.cpu().detach().numpy().tofile(
-                        f"{betas_dir}/rawbetas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.rbetas")
-                    betas.cpu().detach().numpy().tofile(
-                        f"{betas_dir}/betas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.betas")
+                    if iteration % 10_000: # just to check, but is not necessary as they are not meant to be changing
+                        self.raw_betas.cpu().detach().numpy().tofile(
+                            f"{betas_dir}/rawbetas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.rbetas")
+                        betas.cpu().detach().numpy().tofile(
+                            f"{betas_dir}/betas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.betas")
 
                     if iteration % 10_000 == 0:
                         for (x0v, xtv, tv) in zip(x_0, x_t, t):
@@ -385,17 +388,11 @@ class DiffusionModel(nn.Module):
                 #     if par.grad is not None:
                 #         par.grad.data.mul_(accumulation_steps/actual_acums)
                 acloss /= accs
-                beta_regloss = self.l2_lam*torch.sum(betas**2)
-                acloss += beta_regloss
 
                 acloss.backward()
 
                 optimiser.step()
                 optimiser.zero_grad()
-
-                betas = nn.functional.sigmoid(self.raw_betas)
-                alphas = ((1 - betas).to(self.device))
-                bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
 
                 acloss = torch.tensor(0.0, device=self.device)
                 accs = 0
@@ -411,7 +408,7 @@ class DiffusionModel(nn.Module):
 
     @torch.no_grad()
     def sample(self, extrema, num_samples=1, params=None):
-        betas = nn.functional.sigmoid(self.raw_betas).to(self.device)
+        betas = self.raw_betas.clone()
         alphas = ((1 - betas).to(self.device))
         bar_alphas = (torch.cumprod(alphas, dim=0).to(self.device))
         if params is None:

@@ -9,6 +9,16 @@ def load_data(path):
 
 
 def plot_data(arr1, arr2, prefix, out_dir):
+    # Calculate the global min and max
+    global_min = min(np.min(arr1), np.min(arr2))
+    global_max = max(np.max(arr1), np.max(arr2))
+    
+    # Calculate the range and add a 10% margin
+    y_range = global_max - global_min
+    margin = y_range * 0.1
+    global_min -= margin
+    global_max += margin
+
     plt.figure(figsize=(14, 6))
 
     plt.subplot(1, 2, 1)
@@ -16,12 +26,14 @@ def plot_data(arr1, arr2, prefix, out_dir):
     plt.title(f'{prefix} First Array')
     plt.xlabel('Index')
     plt.ylabel('Value')
+    plt.ylim(global_min, global_max)  # Set the y-limits with margin
 
     plt.subplot(1, 2, 2)
     plt.plot(arr2)
     plt.title(f'{prefix} Last Array')
     plt.xlabel('Index')
     plt.ylabel('Value')
+    plt.ylim(global_min, global_max)  # Set the y-limits with margin
 
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f'{prefix}_plots.png'))
