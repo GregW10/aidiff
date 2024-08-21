@@ -59,7 +59,8 @@ def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, outp
     ]
     subprocess.run(command, check=True)
     if ftype == "Lf":
-        subprocess.run(["mkdir", "shitdir"], check=True)
+        os.makedirs("shitdir", exist_ok=True)
+        # subprocess.run(["mkdir", "shitdir"], check=True)
         subprocess.run(["fconv", "lf", output_dffr_path, "-o", "shitdir"], check=True)
         subprocess.run(["mv", "-v", f"shitdir/{os.listdir('shitdir')[0]}", f"./{output_dffr_path}"], check=True)
         subprocess.run(["rm", "-rfv", "shitdir"], check=True)
@@ -126,7 +127,7 @@ def main():
     diff_model = DiffusionModel(T=1_000, width=32, height=32, device=device)
     diff_model.load_state_dict(torch.load("model.pth"))
 
-    num_samples = 20
+    num_samples = 100
     samples, params = diff_model.sample(extrema, num_samples=num_samples)
     
     total_true_distance = 0.0
