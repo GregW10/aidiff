@@ -15,16 +15,14 @@ import math
 import tempfile
 
 
-def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, output_bmp_path):
-    # Constants derived from gen.sh
-    l_max = -8
+def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, output_bmp_path, nx=32, ny=32):
+    l_max = -8 # values are from my gen.sh script
     l_b = -5
     z_b = math.exp(l_b * math.log(10))
     min_tol = math.exp(l_max * math.log(10))
     tol_cut = 1e-12
     lams = -8.5
 
-    # Calculate tolerance values
     logz = math.log(distance) / math.log(10)
     lamdiff = lams + (math.log(wavelength) / math.log(10)) - logz
 
@@ -37,17 +35,15 @@ def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, outp
         else:
             tol = math.exp(lamdiff * math.log(10))
 
-    # Determine the floating point precision
     ftype = "Lf" if tol < tol_cut else "lf"
 
-    # Adjust detector width and length if necessary
     wl = 1.5 * distance
     one_p5_apl = 1.5 * aperture
     if wl < one_p5_apl:
         wl = one_p5_apl
 
     command = [
-        "dffrcc", "--nx", "32", "--ny", "32", "--lam", str(wavelength),
+        "dffrcc", "--nx", str(nx), "--ny", str(ny), "--lam", str(wavelength),
         "--xa", str(-aperture/2), "--xb", str(aperture/2),
         "--ya", str(-aperture/2), "--yb", str(aperture/2),
         "--z", str(distance), "--w", str(wl), "--l", str(wl),
@@ -59,7 +55,8 @@ def run_dffrcc_simulation(aperture, wavelength, distance, output_dffr_path, outp
     ]
     subprocess.run(command, check=True)
     if ftype == "Lf":
-        subprocess.run(["mkdir", "shitdir"], check=True)
+        os.makedirs("shitdir", exist_ok=True)
+        # subprocess.run(["mkdir", "shitdir"], check=True)
         subprocess.run(["fconv", "lf", output_dffr_path, "-o", "shitdir"], check=True)
         subprocess.run(["mv", "-v", f"shitdir/{os.listdir('shitdir')[0]}", f"./{output_dffr_path}"], check=True)
         subprocess.run(["rm", "-rfv", "shitdir"], check=True)
@@ -86,7 +83,7 @@ def load_dffr(file_path):
     return data
 
 
-def save_dffr(file_path, data, params, detector_size=256):
+def save_dffr(file_path, data, params, detector_size=32):
     with open(file_path, "wb") as f:
         # Header and metadata
         f.write(b'DFFR')
@@ -126,7 +123,7 @@ def main():
     diff_model = DiffusionModel(T=1_000, width=32, height=32, device=device)
     diff_model.load_state_dict(torch.load("model.pth"))
 
-    num_samples = 20
+    num_samples = 100
     samples, params = diff_model.sample(extrema, num_samples=num_samples)
     
     total_true_distance = 0.0

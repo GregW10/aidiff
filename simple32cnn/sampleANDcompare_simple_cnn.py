@@ -1,0 +1,1 @@
+../simple256cnn/sampleANDcompare_simple_cnn.py

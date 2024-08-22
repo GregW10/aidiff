@@ -25,32 +25,15 @@ def lognormal_to_gauss(mu_ln: float, sigma_ln: float) -> tuple[float, float]:
     return (math.log(mu_ln / math.sqrt(squared_p1)), math.sqrt(math.log(squared_p1)))
 
 
-def is_symmetric(image, threshold=0.001):
-    """
-    Check if the image is symmetric about y=x and y=-x diagonals.
-    Args:
-        image (np.ndarray): 2D array representing the image.
-        threshold (float): Threshold for asymmetry.
-    Returns:
-        bool: True if the image is symmetric, False otherwise.
-    """
+def is_symmetric(image, threshold=0.01):
     if image.shape[0] != image.shape[1]:
-        raise ValueError("Image must be square for this symmetry check.")
-    
-    flipped_lr = np.fliplr(image)
-    flipped_ud = np.flipud(image)
-    symm_yx = np.abs(image - flipped_lr.T).mean()
-    symm_ynegx = np.abs(image - flipped_ud.T).mean()
-    
+        raise ValueError("Error: image must be square for this symmetry check.")
+    norm_img = image/np.max(image)
+    flipped_lr = np.fliplr(norm_img)
+    flipped_ud = np.flipud(norm_img)
+    symm_yx = np.sqrt(np.sum(np.abs(norm_img**2 - flipped_lr.T**2)))
+    symm_ynegx = np.sqrt(np.sum(np.abs(norm_img**2 - flipped_ud.T**2)))
     return symm_yx < threshold and symm_ynegx < threshold
-
-
-def average_pooling(data, size=32):
-    """
-    Downsample the data from 256x256 to size x size using average pooling.
-    """
-    pooled_data = data.reshape(size, data.shape[0] // size, size, data.shape[1] // size).mean(axis=(1, 3))
-    return pooled_data
 
 
 def load_extrema(file_path):
@@ -62,11 +45,13 @@ def load_extrema(file_path):
 
 
 class DFFRDataset(Dataset):
-    def __init__(self, data_dir, device, threshold=0.00001, rnk=0):
+    def __init__(self, data_dir, device, Nx=32, Ny=32, threshold=0.01, rnk=0):
         # super(DFFRDataset, self).__init__()
         self.data_dir = data_dir
         self.device = device
         self.threshold = threshold
+        self.nx = Nx
+        self.ny = Ny
         self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.dffr')]
         self.discarded_files = []
         if threshold >= 0.0:
@@ -127,9 +112,9 @@ class DFFRDataset(Dataset):
             aperture_size = upper_x_limit - lower_x_limit
             data = np.fromfile(f, dtype=np.float64).reshape((vertical_resolution, horizontal_resolution))
 
-        assert data.shape == (256, 256), "Shape is not 256x256"
+        assert data.shape == (self.ny, self.nx), f"Shape is not {self.nx}x{self.ny}"
 
-        data = average_pooling(data, 32)
+        # data = average_pooling(data, 32)
 
         norm_data = data / self.extrema['intensity_max']
         norm_params = np.array([
@@ -144,18 +129,16 @@ class DFFRDataset(Dataset):
         valid_files = []
         discarded_dir = 'discarded_pats'
         os.makedirs(discarded_dir, exist_ok=True)
-        
         for file_path in tqdm(self.files, desc='Filtering files for symmetry'):
             with open(file_path, 'rb') as f:
                 f.seek(104)
                 data = np.fromfile(f, dtype=np.float64)
-                if data.size != 256 * 256:
-                    print(f"Unexpected size for file {file_path}: {data.size}")
+                if data.size != self.nx*self.ny:
+                    print(f"Error: unexpected size for file {file_path}: {data.size}")
                     self.discarded_files.append(file_path)
                     continue
-                
-                data = data.reshape((256, 256))
-                data = average_pooling(data, 32)
+                data = data.reshape((self.nx, self.ny))
+                # data = average_pooling(data, 32)
                 if is_symmetric(data, self.threshold):
                     valid_files.append(file_path)
                 else:
@@ -165,11 +148,10 @@ class DFFRDataset(Dataset):
                     plt.title(f'Discarded: {base_name}')
                     plt.savefig(os.path.join(discarded_dir, base_name))
                     plt.clf()
-        
+        plt.close()
         print("Discarded Files:")
         for file_path in self.discarded_files:
             print(file_path)
-        
         return valid_files
 
     def find_extrema(self):
@@ -181,7 +163,6 @@ class DFFRDataset(Dataset):
         wavelength_max = float('-inf')
         distance_min = float('inf')
         distance_max = float('-inf')
-
         for file_path in tqdm(self.files, desc='Finding extrema'):
             with open(file_path, 'rb') as f:
                 f.seek(12)
@@ -200,7 +181,7 @@ class DFFRDataset(Dataset):
                 aperture_size = upper_x_limit - lower_x_limit
                 data = np.fromfile(f, dtype=np.float64).reshape((vertical_resolution, horizontal_resolution))
 
-                data = average_pooling(data, 32)
+                # data = average_pooling(data, 32)
 
                 intensity_min = min(intensity_min, np.min(data))
                 intensity_max = max(intensity_max, np.max(data))
@@ -223,7 +204,6 @@ class DFFRDataset(Dataset):
         }
 
 
-# Inverse sigmoid function
 def inverse_sigmoid(y):
     return np.log(y / (1 - y))
 
@@ -235,7 +215,6 @@ class DiffusionModel(nn.Module):
                  height: int = 32,
                  num_channels: int = 1,
                  device="cpu",
-                 l2_lam=1e-4,
                  rnk=0):
         super(DiffusionModel, self).__init__()
         self.T = T
@@ -244,7 +223,6 @@ class DiffusionModel(nn.Module):
         self.height = height
         self.num_channels = num_channels
         self.device = device
-        self.l2_lam = l2_lam
 
         # self.betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device)
         # self.alphas = (1 - self.betas).to(device)
@@ -253,15 +231,15 @@ class DiffusionModel(nn.Module):
         # target_array = np.linspace(start=0.0001, stop=0.02, num=T)
         # inv_array = inverse_sigmoid(target_array)
 
-        start_beta = 0.00001
-        stop_beta  = 0.025
-        steep      = 4
+        # start_beta = 0.00001
+        # stop_beta  = 0.025
+        # steep      = 4
 
-        x = np.linspace(0, 1, 1_000)
+        # x = np.linspace(0, 1, 1_000)
 
-        betas = (((np.exp(steep*x) - 1)/(np.e**steep - 1)))*(stop_beta - start_beta) + start_beta
+        # betas = (((np.exp(steep*x) - 1)/(np.e**steep - 1)))*(stop_beta - start_beta) + start_beta
 
-        self.raw_betas = torch.tensor(betas, dtype=torch.float32)
+        self.raw_betas = torch.linspace(start=0.0001, end=0.02, steps=T, device=device, dtype=torch.float32)
 
         # Define betas as a learnable parameter, I initialise with DDPMs paper values
         # self.betas = nn.Parameter(torch.linspace(start=0.0001, end=0.02, steps=T, device=device))
@@ -361,14 +339,15 @@ class DiffusionModel(nn.Module):
                 if self.rank == 0 and iteration % 100 == 0:
                     print(f"Epoch {epoch}/{num_epochs}, it. {iteration}/{num_its}, Loss: {loss.item()}", flush=True)
                     cf.write(f"{epoch},{iteration},{loss.item()}\n")
+                    cf.flush()
                     # if iteration % 100 == 0:
                     #     torch.save(self.state_dict(),
                     #                f"{model_dir}/model_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.pth")
-                    if iteration % 10_000: # just to check, but is not necessary as they are not meant to be changing
-                        self.raw_betas.cpu().detach().numpy().tofile(
-                            f"{betas_dir}/rawbetas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.rbetas")
-                        betas.cpu().detach().numpy().tofile(
-                            f"{betas_dir}/betas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.betas")
+                    # if iteration % 10_000: # just to check, but is not necessary as they are not meant to be changing
+                        # self.raw_betas.cpu().detach().numpy().tofile(
+                            # f"{betas_dir}/rawbetas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.rbetas")
+                        # betas.cpu().detach().numpy().tofile(
+                            # f"{betas_dir}/betas_epoch{epoch:0{elen}d}_it{iteration:0{dlen}d}.betas")
 
                     if iteration % 10_000 == 0:
                         for (x0v, xtv, tv) in zip(x_0, x_t, t):
@@ -440,84 +419,11 @@ class DiffusionModel(nn.Module):
         return x*extrema["intensity_max"], params
 
 
-'''
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(62195 + rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-'''
-
-
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = os.environ.get('SLURM_LAUNCH_NODE_IPADDR', 'localhost')
-    os.environ['MASTER_PORT'] = str(12355 + int(os.environ.get('SLURM_PROCID', '0')))
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-
-def cleanup():
-    dist.barrier()
-    dist.destroy_process_group()
-
-
-def train(rank, world_size, data_dir, sym_threshold, T, batch_size, lr, epochs):
-    setup(rank, world_size)
-    device = torch.device(f'cuda:{rank}')
-
-    dataset = DFFRDataset(data_dir, device, threshold=sym_threshold, rnk=rank)
-    train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
-    infinite_dataloader = cycle(dataloader)
-
-    model = UNet().to(device)
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[rank])
-
-    diff_model = DiffusionModel(T, model, width=32, height=32, device=device, rnk=rank)
-
-    optim = torch.optim.Adam(model.parameters(), lr=lr)
-
-    print(f"Starting training for process with rank {rank}...")
-
-    diff_model.train(infinite_dataloader, optim, num_epochs=epochs, accumulation_steps=4)
-
-    cleanup()
-
-
-def main_multi_gpu():
-    print("Multi-GPU execution.")
-    with open(f"{os.getpid()}.pid", 'w') as f:
-        f.write(f"{os.getpid()}\n")
-    data_dir = "data/"
-    sym_threshold = 1e-5
-    T = 1_000
-    batch_size = 1  # Adjust based on GPU memory
-    lr = 1e-5
-    epochs = 100_000
-
-    world_size = torch.cuda.device_count()
-    mp.spawn(train, args=(world_size, data_dir, sym_threshold, T, batch_size, lr, epochs), nprocs=world_size, join=True)
-
-    # Sampling part can be done separately after training
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    diff_model = DiffusionModel(T, width=32, height=32, device=device)
-    diff_model.load_state_dict(torch.load('model.pth'))
-
-    num_samples = 1
-    samples, params = diff_model.sample(num_samples)
-
-    counter = 0
-    while counter < num_samples:
-        plt.imshow(samples[counter][0].cpu().numpy(), cmap="gray")
-        plt.title(f"Aperture: {params[counter][0].item()}, Wavelength: {params[counter][1].item()}, Distance: {params[counter][2].item()}")
-        plt.savefig(f"sample{counter}.png")
-        plt.clf()
-        counter += 1
-
-
 def main_single_gpu():
     print("Single/zero-GPU execution.")
     data_dir = "data/"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sym_threshold = 1e-6
+    sym_threshold = 0.01 # higher now because I'm using Euclidean distance
     dataset = DFFRDataset(data_dir, device, threshold=sym_threshold)
     batch_size = 4  # Reduced batch size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -534,37 +440,19 @@ def main_single_gpu():
     if len(sys.argv) > 1:
         diff_model.load_state_dict(torch.load(sys.argv[1]))
 
-    diff_model.l2_lam = 1e-3  # betas regularisation
-
     lr = 1e-5
     # optim = torch.optim.Adam(model.parameters(), lr=lr)
 
-    epochs = 100_000
+    epochs = 1_000_000
 
     acc_steps = 4
 
     diff_model.train(dataloader, lr=lr, num_epochs=epochs, accumulation_steps=acc_steps)
 
-    num_samples = 20
-    samples, params = diff_model.sample(dataset.extrema, num_samples)
-
-    counter = 0
-    while counter < num_samples:
-        plt.imshow(samples[counter][0].cpu().numpy(), cmap="gray")
-        plt.title(f"Aperture: {params[counter][0].item()}, Wavelength: {params[counter][1].item()}, Distance: {params[counter][2].item()}")
-        plt.savefig(f"sample{counter}.png")
-        plt.clf()
-        counter += 1
-
 
 def main():
-    if torch.cuda.device_count() > 1:
-        print(f"Multi-GPU\nNum. devices: {torch.cuda.device_count()}")
-        # main_single_gpu()
-        main_multi_gpu()
-    else:
-        print("Single GPU")
-        main_single_gpu()
+    print("Single GPU")
+    main_single_gpu()
 
 
 if __name__ == "__main__":
